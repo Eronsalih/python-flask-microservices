@@ -1,0 +1,114 @@
+name: Variant B CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+jobs:
+  build-and-push:
+    name: Build & Push - ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: user-service
+            context: ./user-service
+          - service: product-service
+            context: ./product-service
+          - service: order-service
+            context: ./order-service
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_USER }}/${{ matrix.service }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=tag
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    name: Deploy to Azure VM
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    env:
+      DOCKER_USER: ${{ secrets.DOCKER_USER }}
+      IMAGE_TAG: ${{ github.ref_name }}
+      APP_ENV_FILE: ${{ secrets.APP_ENV_FILE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare application directory
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.AZURE_VM_IP }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            mkdir -p /opt/app/nginx
+
+      - name: Copy production files to VM
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.AZURE_VM_IP }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.prod.yml,nginx/nginx.conf"
+          target: "/opt/app"
+
+      - name: Deploy application
+        uses: appleboy/ssh-action@v1
+        env:
+          APP_ENV_FILE: ${{ secrets.APP_ENV_FILE }}
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          IMAGE_TAG: ${{ github.ref_name }}
+        with:
+          host: ${{ secrets.AZURE_VM_IP }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: APP_ENV_FILE,DOCKER_USER,IMAGE_TAG
+          script: |
+            cd /opt/app
+
+            printf '%s\n' "$APP_ENV_FILE" > .env
+            printf '\nDOCKER_USER=%s\nIMAGE_TAG=%s\n' "$DOCKER_USER" "$IMAGE_TAG" >> .env
+
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d
+
+            docker compose -f docker-compose.prod.yml ps
+
+            curl --fail --retry 12 --retry-delay 5 http://localhost/

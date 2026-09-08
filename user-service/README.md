@@ -12,7 +12,7 @@ docker run -p 5001:5001 --detach --name user-service --net=micro_network user-sr
 $ flask shell
 from application.models import User
 from application import db
-admin = User(username="foo", email="foo@admin.com",first_name="foo", last_name="bar", password="admin2020",is_admin=True)
+admin = User(username="foo", email="foo@admin.com",first_name="foo", last_name="bar", password="password="<ADMIN_PASSWORD>",is_admin=True)
 db.session.add(admin)
 db.session.commit()
 ```

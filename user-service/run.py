@@ -28,6 +28,9 @@ app.session_interface = CustomSessionInterface()
 def user_loaded_from_header(self, user=None):
     g.login_via_header = True
 
+@app.route('/health')
+def health():
+    return 'OK', 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001)
