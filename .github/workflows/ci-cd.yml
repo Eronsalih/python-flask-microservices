@@ -8,6 +8,9 @@ on:
       - "v*"
 
 jobs:
+  # =========================================================
+  # JOB 1 - BUILD AND PUSH TO DOCKER HUB
+  # =========================================================
   build-and-push:
     name: Build & Push - ${{ matrix.service }}
     runs-on: ubuntu-latest
@@ -18,8 +21,10 @@ jobs:
         include:
           - service: user-service
             context: ./user-service
+
           - service: product-service
             context: ./product-service
+
           - service: order-service
             context: ./order-service
 
@@ -52,10 +57,15 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
-   deploy:
+  # =========================================================
+  # JOB 2 - DEPLOY TO AZURE VM
+  # Runs ONLY for tags such as v1.0.0, v1.0.1...
+  # =========================================================
+  deploy:
     name: Deploy to Azure VM
     needs: build-and-push
     runs-on: ubuntu-latest
@@ -63,51 +73,171 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
+      # -------------------------------------------------------
+      # Checkout
+      # -------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Create production env file
+      # -------------------------------------------------------
+      # Create production .env on GitHub runner
+      # -------------------------------------------------------
+      - name: Create production environment file
         env:
           APP_ENV_FILE: ${{ secrets.APP_ENV_FILE }}
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          IMAGE_TAG: ${{ github.ref_name }}
         run: |
-          printf '%s\n' "$APP_ENV_FILE" > .env.production
-          printf '\nDOCKER_USER=%s\nIMAGE_TAG=%s\n' \
-            "${{ secrets.DOCKER_USER }}" \
-            "${{ github.ref_name }}" >> .env.production
+          set -euo pipefail
 
-      - name: Prepare application directory
+          # Write APP_ENV_FILE secret
+          # Remove possible Windows CR characters
+          printf '%s\n' "$APP_ENV_FILE" | tr -d '\r' > .env.production
+
+          # Add deployment-specific values
+          printf '\nDOCKER_USER=%s\n' "$DOCKER_USER" >> .env.production
+          printf 'IMAGE_TAG=%s\n' "$IMAGE_TAG" >> .env.production
+
+          # Validate required variables without printing secrets
+          for key in \
+            MYSQL_ROOT_PASSWORD \
+            MYSQL_USER \
+            MYSQL_PASSWORD \
+            SECRET_KEY \
+            DOCKER_USER \
+            IMAGE_TAG
+          do
+            if ! grep -Eq "^${key}=.+" .env.production; then
+              echo "::error::Required variable ${key} is missing or empty"
+              exit 1
+            fi
+          done
+
+          echo "Production environment file created successfully."
+
+      # -------------------------------------------------------
+      # Prepare /opt/app on Azure VM
+      # -------------------------------------------------------
+      - name: Prepare Azure application directory
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.AZURE_VM_IP }}
           username: ${{ secrets.AZURE_VM_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            set -e
+
+            mkdir -p /opt/app
             mkdir -p /opt/app/nginx
 
-      - name: Copy production files to VM
+            test -w /opt/app
+
+            echo "Azure application directory is ready."
+
+      # -------------------------------------------------------
+      # Copy production files to Azure VM
+      # -------------------------------------------------------
+      - name: Copy production files to Azure VM
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.AZURE_VM_IP }}
           username: ${{ secrets.AZURE_VM_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+
           source: "docker-compose.prod.yml,nginx/nginx.conf,.env.production"
           target: "/opt/app"
 
+      # -------------------------------------------------------
+      # Deploy
+      # -------------------------------------------------------
       - name: Deploy application
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.AZURE_VM_IP }}
           username: ${{ secrets.AZURE_VM_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+
           script: |
+            set -e
+
             cd /opt/app
 
-            mv .env.production .env
+            echo "Preparing production environment..."
+
+            mv -f .env.production .env
             chmod 600 .env
 
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d
 
-            docker compose -f docker-compose.prod.yml ps
+            # -------------------------------------------------
+            # Validate .env
+            # -------------------------------------------------
+            for key in \
+              MYSQL_ROOT_PASSWORD \
+              MYSQL_USER \
+              MYSQL_PASSWORD \
+              SECRET_KEY \
+              DOCKER_USER \
+              IMAGE_TAG
+            do
+              if ! grep -Eq "^${key}=.+" .env; then
+                echo "ERROR: ${key} is missing from production .env"
+                exit 1
+              fi
+            done
 
-            curl --fail --retry 12 --retry-delay 5 http://localhost/
+            echo "Production environment validated."
+
+
+            # -------------------------------------------------
+            # Validate Compose file
+            # -------------------------------------------------
+            echo "Validating Docker Compose..."
+
+            docker compose \
+              -f docker-compose.prod.yml \
+              config > /dev/null
+
+
+            # -------------------------------------------------
+            # Pull versioned images from Docker Hub
+            # -------------------------------------------------
+            echo "Pulling Docker images..."
+
+            docker compose \
+              -f docker-compose.prod.yml \
+              pull
+
+
+            # -------------------------------------------------
+            # Start production stack
+            # -------------------------------------------------
+            echo "Starting production stack..."
+
+            docker compose \
+              -f docker-compose.prod.yml \
+              up -d --remove-orphans
+
+
+            # -------------------------------------------------
+            # Show container state
+            # -------------------------------------------------
+            echo "Container status:"
+
+            docker compose \
+              -f docker-compose.prod.yml \
+              ps
+
+
+            # -------------------------------------------------
+            # Post-deployment HTTP test
+            # -------------------------------------------------
+            echo "Testing application..."
+
+            curl \
+              --fail \
+              --retry 24 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              http://127.0.0.1/
+
+            echo "Deployment completed successfully."
