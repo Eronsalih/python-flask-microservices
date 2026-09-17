@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  user-service:
+    image: ${DOCKERHUB_USERNAME}/user-service:latest
+    container_name: user-service
+    ports:
+      - "5001:5000"
+    environment:
+      - FLASK_ENV=production
+    networks:
+      - microservices-net
+
+  product-service:
+    image: ${DOCKERHUB_USERNAME}/product-service:latest
+    container_name: product-service
+    ports:
+      - "5002:5000"
+    environment:
+      - FLASK_ENV=production
+    networks:
+      - microservices-net
+
+  order-service:
+    image: ${DOCKERHUB_USERNAME}/order-service:latest
+    container_name: order-service
+    ports:
+      - "5003:5000"
+    environment:
+      - FLASK_ENV=production
+      - USER_SERVICE_URL=http://user-service:5000
+      - PRODUCT_SERVICE_URL=http://product-service:5000
+    depends_on:
+      - user-service
+      - product-service
+    networks:
+      - microservices-net
+
+  frontend:
+    image: ${DOCKERHUB_USERNAME}/frontend:latest
+    container_name: frontend
+    ports:
+      - "5000:5000"
+    environment:
+      - USER_SERVICE_URL=http://user-service:5000
+      - PRODUCT_SERVICE_URL=http://product-service:5000
+      - ORDER_SERVICE_URL=http://order-service:5000
+    depends_on:
+      - user-service
+      - product-service
+      - order-service
+    networks:
+      - microservices-net
+
+networks:
+  microservices-net:
+    driver: bridge
